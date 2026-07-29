@@ -1,0 +1,9 @@
+# Build artifacts
+build/
+dist/
+*.spec
+build_log.txt
+__pycache__/
+
+# Test clips
+*.mp4
