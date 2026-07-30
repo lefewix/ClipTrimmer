@@ -362,22 +362,24 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <title>ClipTrimmer Studio</title>
 <style>
   :root {
-    --bg: #0c0d11;
-    --panel: #14161c;
-    --panel-2: #1b1e26;
-    --panel-3: #232733;
-    --line: #2b2f3a;
-    --line-soft: #21242e;
-    --text: #e9ebef;
-    --muted: #888f9e;
-    --muted-2: #5f6675;
-    --accent: #5b8cff;
-    --accent-dim: #2f4a8a;
-    --green: #3fcf8e;
-    --green-dim: #1f6b4a;
-    --red: #ff5d6c;
-    --red-dim: #7a2c34;
-    --amber: #f5b945;
+    /* Warm-dark member of the family: same umber/almond hues as the extensions,
+       kept dark because a video stage belongs on a dark surround. */
+    --bg: #211a17;
+    --panel: #2a221e;
+    --panel-2: #332a25;
+    --panel-3: #3d332d;
+    --line: #4a3e37;
+    --line-soft: #3a302a;
+    --text: #f7f0f5;
+    --muted: #a89d94;
+    --muted-2: #8f857d;
+    --accent: #decbb7;
+    --accent-dim: #8f857d;
+    --green: #7fae8d;
+    --green-dim: #46604f;
+    --red: #c77f70;
+    --red-dim: #6e4038;
+    --amber: #d3a95c;
     --radius: 12px;
     --radius-sm: 9px;
   }
@@ -385,7 +387,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   html, body { height: 100%; }
   body {
     background:
-      radial-gradient(900px 500px at 12% -5%, #1a1f2e 0%, transparent 60%),
+      radial-gradient(900px 500px at 12% -5%, #2e241e 0%, transparent 60%),
       var(--bg);
     color: var(--text);
     font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -402,9 +404,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
   .logo {
     width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
-    background: linear-gradient(135deg, var(--accent), #6f5bff);
+    background: linear-gradient(135deg, var(--accent), #b09a82);
+    color: #2a211e;
     display: flex; align-items: center; justify-content: center;
-    font-size: 16px; box-shadow: 0 2px 10px rgba(91,140,255,.35);
+    font-size: 16px; box-shadow: 0 2px 10px rgba(222,203,183,.22);
   }
   .brand { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
   .brand span { color: var(--muted-2); font-weight: 500; margin-left: 5px; }
@@ -562,15 +565,15 @@ PAGE_HTML = r"""<!DOCTYPE html>
     display: flex; align-items: center; gap: 8px; letter-spacing: .3px;
   }
   .mark-in {
-    background: rgba(63,207,142,.14); border-color: var(--green-dim);
+    background: rgba(127,174,141,.14); border-color: var(--green-dim);
     color: var(--green);
   }
-  .mark-in:hover { background: rgba(63,207,142,.22); }
+  .mark-in:hover { background: rgba(127,174,141,.22); }
   .mark-out {
-    background: rgba(255,93,108,.14); border-color: var(--red-dim);
+    background: rgba(199,127,112,.14); border-color: var(--red-dim);
     color: var(--red);
   }
-  .mark-out:hover { background: rgba(255,93,108,.22); }
+  .mark-out:hover { background: rgba(199,127,112,.22); }
   .mark-btn kbd { background: rgba(0,0,0,.3); }
 
   .timeline {
@@ -601,7 +604,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
   .tl-selection {
     position: absolute; top: 0; bottom: 0;
-    background: rgba(91,140,255,.14); pointer-events: none;
+    background: rgba(222,203,183,.16); pointer-events: none;
   }
   /* in / out markers: a colored line with a triangle flag on top */
   .tl-marker {
@@ -660,7 +663,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
   .preset:hover { border-color: var(--accent-dim); }
   .preset.active {
-    border-color: var(--accent); background: rgba(91,140,255,.12);
+    border-color: var(--accent); background: rgba(222,203,183,.12);
   }
   .preset .p-name { font-size: 12.5px; font-weight: 600;
     display: flex; align-items: center; gap: 6px; }
@@ -693,8 +696,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
   .trim-row.in  { border-left: 3px solid var(--green); }
   .trim-row.out { border-left: 3px solid var(--red); }
-  .trim-row.in  .tag { background: rgba(63,207,142,.16); color: var(--green); }
-  .trim-row.out .tag { background: rgba(255,93,108,.16); color: var(--red); }
+  .trim-row.in  .tag { background: rgba(127,174,141,.16); color: var(--green); }
+  .trim-row.out .tag { background: rgba(199,127,112,.16); color: var(--red); }
   .trim-row .tval {
     flex: 1; font-size: 15px; font-weight: 600;
     font-variant-numeric: tabular-nums; letter-spacing: .5px;
@@ -743,7 +746,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     width: 16px; height: 16px; border-radius: 50%;
     background: var(--muted); transition: left .15s, background .15s;
   }
-  .toggle.on { background: rgba(91,140,255,.25);
+  .toggle.on { background: rgba(222,203,183,.25);
     border-color: var(--accent); }
   .toggle.on .knob { left: 20px; background: var(--accent); }
 
@@ -793,19 +796,19 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .go-btn {
     width: 100%; border: none; border-radius: var(--radius);
     padding: 15px; font-size: 14.5px; font-weight: 700;
-    color: #fff; letter-spacing: .3px;
-    background: linear-gradient(135deg, var(--accent), #6f5bff);
+    color: #2a211e; letter-spacing: .3px;
+    background: linear-gradient(135deg, var(--accent), #c4ab90);
     display: flex; align-items: center; justify-content: center; gap: 9px;
-    box-shadow: 0 4px 16px rgba(91,140,255,.32);
+    box-shadow: 0 4px 16px rgba(222,203,183,.20);
     transition: transform .1s, box-shadow .15s, filter .15s;
   }
-  .go-btn:hover { filter: brightness(1.08);
-    box-shadow: 0 6px 22px rgba(91,140,255,.42); }
+  .go-btn:hover { filter: brightness(1.05);
+    box-shadow: 0 6px 22px rgba(222,203,183,.28); }
   .go-btn:active { transform: translateY(1px); }
   .go-btn:disabled { filter: grayscale(.7) brightness(.7);
     box-shadow: none; cursor: not-allowed; }
-  .go-btn kbd { background: rgba(0,0,0,.28); border-color: rgba(0,0,0,.4);
-    color: #fff; }
+  .go-btn kbd { background: rgba(42,33,30,.18); border-color: rgba(42,33,30,.32);
+    color: #2a211e; }
 
   /* secondary action - deliberately neutral so it doesn't compete with
      the primary Trim & Compress button */
@@ -828,14 +831,14 @@ PAGE_HTML = r"""<!DOCTYPE html>
     font-variant-numeric: tabular-nums;
   }
   .toast.show { display: block; }
-  .toast.ok  { background: rgba(63,207,142,.12);
-    border: 1px solid var(--green-dim); color: #bff3da; }
-  .toast.err { background: rgba(255,93,108,.12);
-    border: 1px solid var(--red-dim); color: #ffc9ce; }
+  .toast.ok  { background: rgba(127,174,141,.12);
+    border: 1px solid var(--green-dim); color: #cfe3d5; }
+  .toast.err { background: rgba(199,127,112,.12);
+    border: 1px solid var(--red-dim); color: #ecd0c7; }
 
   .warn-banner {
-    margin: 12px 18px 0; background: rgba(245,185,69,.1);
-    border: 1px solid #6b551f; color: #f3d99e;
+    margin: 12px 18px 0; background: rgba(211,169,92,.10);
+    border: 1px solid #6e5836; color: #e8d3a8;
     padding: 10px 13px; border-radius: var(--radius-sm);
     font-size: 12.5px; display: none;
   }
