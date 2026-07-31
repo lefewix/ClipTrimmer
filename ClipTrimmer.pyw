@@ -79,7 +79,9 @@ def pick_free_port(preferred=8731, attempts=40):
 
 
 RESOURCE_DIR = resource_dir()
-PORT = pick_free_port(8731)
+# PORT is finalized in _start_server(), which binds directly (avoiding the
+# check-then-bind race of probing a port first). This is only a placeholder.
+PORT = 8731
 
 # Per-session secret. The page embeds this and sends it on every request; the
 # server rejects requests without it. Combined with the 127.0.0.1-only bind this
@@ -95,6 +97,159 @@ FFMPEG_DIR = APP_DIR / "ffmpeg"
 # Job state shared between the export thread and status polling
 JOBS = {}
 JOB_COUNTER = [0]
+# Live ffmpeg Popen objects per job (kept out of JOBS so status stays
+# JSON-serializable) and the set of jobs the user asked to cancel.
+JOB_PROCS = {}
+JOB_CANCELS = set()
+
+# Ceiling for the video bitrate. Beyond this the encoder just wastes bits
+# (e.g. a 512 MB target on a 10 s clip would request ~400,000 kbps).
+MAX_VIDEO_KBPS = 40000
+
+# First-run FFmpeg download state, polled by the UI via /ffstatus.
+FF_STATE = {"status": "idle", "progress": 0, "message": ""}
+
+
+def compute_bitrates(target_mb, duration, keep_audio):
+    """
+    Pure helper: return (video_kbps, audio_kbps, capped) for a target size in
+    MB and a clip duration in seconds. video_kbps is capped at MAX_VIDEO_KBPS.
+    """
+    duration = max(0.1, duration)
+    total_kbits = target_mb * 8 * 1024
+    if not keep_audio:
+        audio_kbps = 0
+    elif target_mb <= 4:
+        audio_kbps = 96
+    elif target_mb <= 8:
+        audio_kbps = 128
+    else:
+        audio_kbps = 160
+    video_kbps = int((total_kbits / duration - audio_kbps) * 0.97)
+    capped = video_kbps > MAX_VIDEO_KBPS
+    return (min(video_kbps, MAX_VIDEO_KBPS), audio_kbps, capped)
+
+
+def parse_range_header(range_hdr, size):
+    """
+    Pure helper: parse an HTTP Range header against a resource of `size` bytes.
+    Returns:
+      None              - no usable range (absent or malformed): serve whole file
+      (start, end)      - a satisfiable byte range (inclusive)
+    Raises ValueError   - syntactically valid but unsatisfiable (=> 416).
+    """
+    if not range_hdr or not range_hdr.startswith("bytes="):
+        return None
+    spec = range_hdr.split("=", 1)[1].split(",")[0].strip()
+    if "-" not in spec:
+        return None
+    first, last = spec.split("-", 1)
+    try:
+        if first == "" and last != "":
+            # suffix range: last N bytes
+            n = int(last)
+            if n <= 0:
+                raise ValueError("unsatisfiable")
+            return (max(0, size - n), size - 1)
+        start = int(first)
+        end = int(last) if last else size - 1
+    except ValueError as e:
+        if str(e) == "unsatisfiable":
+            raise
+        return None
+    if start < 0:
+        return None
+    # Check satisfiability before well-formedness: "bytes=5000-" on a 1000-byte
+    # file resolves end to 999, which would otherwise look like end < start.
+    if start >= size:
+        raise ValueError("unsatisfiable")
+    if end < start:
+        return None
+    return (start, min(end, size - 1))
+
+
+def validate_export_request(data):
+    """
+    Pure helper: validate the /export JSON payload (everything except the
+    path check, which needs the filesystem). Returns (params, None) on
+    success or (None, error_message) on failure.
+    """
+    if not isinstance(data, dict):
+        return (None, "Request body must be a JSON object.")
+    try:
+        start = float(data["start"])
+        end = float(data["end"])
+        target_mb = float(data["target_mb"])
+    except (KeyError, TypeError, ValueError):
+        return (None, "start, end and target_mb must be numbers.")
+    if not all(x == x and abs(x) != float("inf") for x in (start, end, target_mb)):
+        return (None, "start, end and target_mb must be finite numbers.")
+    if start < 0:
+        return (None, "Start time cannot be negative.")
+    if end - start < 0.1:
+        return (None, "Selection is too short - it must be at least 0.1 seconds.")
+    if not (1 <= target_mb <= 4096):
+        return (None, "Target size must be between 1 and 4096 MB.")
+    try:
+        resolution = int(data.get("resolution", 0) or 0)
+    except (TypeError, ValueError):
+        return (None, "resolution must be a number.")
+    if resolution < 0 or resolution > 4320:
+        return (None, "resolution out of range.")
+    return ({"start": start, "end": end, "target_mb": target_mb,
+             "resolution": resolution,
+             "keep_audio": bool(data.get("keep_audio", True))}, None)
+
+
+def prune_jobs(jobs, keep=8):
+    """
+    Pure helper: drop the oldest finished jobs, keeping at most `keep`
+    finished entries (running/queued jobs and non-job keys are untouched).
+    """
+    finished = [k for k, v in jobs.items()
+                if k.isdigit() and isinstance(v, dict)
+                and v.get("status") in ("done", "error", "cancelled")]
+    finished.sort(key=int)
+    for k in finished[:max(0, len(finished) - keep)]:
+        del jobs[k]
+
+
+def export_active(jobs):
+    """Pure helper: True if any export job is queued or encoding."""
+    return any(isinstance(v, dict) and v.get("status") in ("queued", "encoding")
+               for v in jobs.values())
+
+
+def parse_fps_fraction(s, default=30.0):
+    """
+    Pure helper: parse ffprobe's avg_frame_rate (e.g. '30000/1001', '60/1')
+    into a float fps. Returns `default` for junk or degenerate values.
+    """
+    try:
+        s = (s or "").strip()
+        if "/" in s:
+            num, den = s.split("/", 1)
+            num, den = float(num), float(den)
+            if den == 0:
+                return default
+            fps = num / den
+        else:
+            fps = float(s)
+        if not (1.0 <= fps <= 1000.0):
+            return default
+        return fps
+    except (TypeError, ValueError):
+        return default
+
+
+def guess_video_mime(path):
+    """Pure helper: Content-Type for a video file based on its extension."""
+    ext = os.path.splitext(str(path))[1].lower()
+    return {
+        ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+        ".webm": "video/webm", ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo", ".ts": "video/mp2t",
+    }.get(ext, "application/octet-stream")
 
 # App lifetime / heartbeat state. The UI window pings /alive every couple of
 # seconds; when the window is closed the pings stop and a watchdog thread shuts
@@ -114,12 +269,16 @@ if not _default_out.exists():
 OUTPUT_DIR = [str(_default_out)]   # list so it's mutable from handlers
 
 
-def pick_output_folder():
-    """
-    Open a native OS folder-picker dialog and return the chosen path, or None
-    if cancelled. Uses tkinter, which ships with Python. Runs the dialog on the
-    calling thread; the HTTP handler calls this synchronously.
-    """
+# tkinter is not thread-safe and the HTTP server handles each request on its
+# own thread, so the dialog runs in a single dedicated thread per request,
+# serialized by this lock. A second click while a dialog is open returns
+# immediately with busy=True instead of spawning a second Tk root.
+_PICKER_LOCK = threading.Lock()
+
+
+def _run_folder_dialog(result):
+    """Create a Tk root, show the folder dialog, store the result. Runs in
+    its own dedicated thread so Tk objects live and die on one thread."""
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -131,10 +290,27 @@ def pick_output_folder():
             title="Choose where to save exported clips"
         )
         root.destroy()
-        return chosen or None
+        result["folder"] = chosen or None
     except Exception as e:
         print(f"Folder picker unavailable: {e}")
-        return None
+        result["folder"] = None
+
+
+def pick_output_folder():
+    """
+    Open a native OS folder-picker dialog. Returns (chosen_path_or_None, busy).
+    busy=True means a dialog is already open and no new one was shown.
+    """
+    if not _PICKER_LOCK.acquire(blocking=False):
+        return (None, True)
+    try:
+        result = {}
+        t = threading.Thread(target=_run_folder_dialog, args=(result,))
+        t.start()
+        t.join()
+        return (result.get("folder"), False)
+    finally:
+        _PICKER_LOCK.release()
 
 
 # ----------------------------------------------------------------------------
@@ -178,20 +354,55 @@ def find_ffmpeg():
 
 
 def download_ffmpeg():
-    """Download a static FFmpeg build for Windows. Returns True on success."""
+    """
+    Download a static FFmpeg build for Windows, updating FF_STATE so the UI
+    can show live progress. Returns True on success.
+    """
     url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
     zip_path = APP_DIR / "ffmpeg.zip"
+
+    def _hook(blocks, block_size, total_size):
+        if total_size > 0:
+            pct = min(99, int(blocks * block_size * 100 / total_size))
+            FF_STATE["progress"] = pct
+            FF_STATE["message"] = f"Downloading FFmpeg… {pct}%"
+
     try:
+        FF_STATE.update(status="downloading", progress=0,
+                        message="Downloading FFmpeg… 0%")
         print("Downloading FFmpeg (one-time setup, ~25 MB)...")
-        urllib.request.urlretrieve(url, zip_path)
+        urllib.request.urlretrieve(url, zip_path, reporthook=_hook)
+        FF_STATE.update(status="extracting", progress=99,
+                        message="Extracting FFmpeg…")
         print("Extracting...")
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(FFMPEG_DIR)
         zip_path.unlink(missing_ok=True)
+        FF_STATE.update(status="ready", progress=100, message="FFmpeg ready")
         return True
     except Exception as e:
+        FF_STATE.update(status="error",
+                        message=f"FFmpeg auto-download failed: {e}")
         print(f"FFmpeg auto-download failed: {e}")
         return False
+
+
+def probe_fps(src):
+    """Ask ffprobe for the video's average frame rate. Returns a float fps
+    (default 30.0 if ffprobe is unavailable or the probe fails)."""
+    if not FFPROBE:
+        return 30.0
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        ).stdout.strip().splitlines()
+        return parse_fps_fraction(out[0] if out else "")
+    except Exception:
+        return 30.0
 
 
 FFMPEG, FFPROBE = find_ffmpeg()
@@ -212,6 +423,8 @@ def _run_ffmpeg_pass(cmd, job, duration, pass_label, pass_base, pass_span):
         text=True, bufsize=1,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
     )
+    # Register the live process so /cancel can terminate it.
+    JOB_PROCS[job["id"]] = proc
 
     # FFmpeg writes progress key=value lines to stdout; stderr holds errors.
     # Drain stderr on a side thread so a full pipe can't deadlock the process.
@@ -242,7 +455,23 @@ def _run_ffmpeg_pass(cmd, job, duration, pass_label, pass_base, pass_span):
 
     proc.wait()
     t.join(timeout=1)
+    JOB_PROCS.pop(job["id"], None)
     return proc.returncode, "".join(stderr_lines[-12:])
+
+
+def cancel_export(job_id):
+    """Mark a job cancelled and terminate its ffmpeg process if running."""
+    job = JOBS.get(job_id)
+    if not isinstance(job, dict) or job.get("status") not in ("queued", "encoding"):
+        return False
+    JOB_CANCELS.add(job_id)
+    proc = JOB_PROCS.get(job_id)
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    return True
 
 
 def run_export(job_id, src, start, end, target_mb, output_path,
@@ -257,22 +486,13 @@ def run_export(job_id, src, start, end, target_mb, output_path,
     try:
         duration = max(0.1, end - start)
 
-        # Calculate target bitrate.
-        # total budget (bits) = target_mb * 8 * 1024 * 1024
-        # Pick an audio bitrate that scales down for very small targets so it
-        # doesn't eat the whole budget; reserve ~3% headroom for container
-        # overhead. With audio disabled, audio gets 0 of the budget.
-        total_kbits = target_mb * 8 * 1024
-        if not keep_audio:
-            audio_kbps = 0
-        elif target_mb <= 4:
-            audio_kbps = 96
-        elif target_mb <= 8:
-            audio_kbps = 128
-        else:
-            audio_kbps = 160
-        video_kbps = (total_kbits / duration) - audio_kbps
-        video_kbps = int(video_kbps * 0.97)
+        # Calculate target bitrate (capped at MAX_VIDEO_KBPS - beyond that
+        # extra bits are wasted and encoding just gets slower).
+        video_kbps, audio_kbps, capped = compute_bitrates(
+            target_mb, duration, keep_audio)
+        if capped:
+            job["note"] = (f"Bitrate capped at {MAX_VIDEO_KBPS:,} kbps - "
+                           "the file will be smaller than the target.")
 
         if video_kbps < 50:
             job["status"] = "error"
@@ -307,6 +527,10 @@ def run_export(job_id, src, start, end, target_mb, output_path,
                 "-progress", "pipe:1", "-nostats", null_out]
         rc, err = _run_ffmpeg_pass(cmd1, job, duration,
                                    "Pass 1 of 2 (analyzing)", 0, 40)
+        if job_id in JOB_CANCELS:
+            job["status"] = "cancelled"
+            job["message"] = "Export cancelled."
+            return
         if rc != 0:
             job["status"] = "error"
             job["message"] = "Encoding failed during pass 1.\n" + err
@@ -322,6 +546,10 @@ def run_export(job_id, src, start, end, target_mb, output_path,
                 "-progress", "pipe:1", "-nostats", output_path]
         rc, err = _run_ffmpeg_pass(cmd2, job, duration,
                                    "Pass 2 of 2 (encoding)", 40, 60)
+        if job_id in JOB_CANCELS:
+            job["status"] = "cancelled"
+            job["message"] = "Export cancelled."
+            return
         if rc != 0:
             job["status"] = "error"
             job["message"] = "Encoding failed during pass 2.\n" + err
@@ -332,15 +560,26 @@ def run_export(job_id, src, start, end, target_mb, output_path,
         job["progress"] = 100.0
         job["message"] = (f"Done! Saved to:\n{output_path}\n"
                            f"Final size: {final_mb:.2f} MB")
+        if job.get("note"):
+            job["message"] += "\n" + job["note"]
         job["output"] = output_path
     except Exception as e:
         job["status"] = "error"
         job["message"] = f"Unexpected error: {e}"
     finally:
-        # Always remove the two-pass log files, even if a pass failed.
+        JOB_PROCS.pop(job_id, None)
+        JOB_CANCELS.discard(job_id)
+        # Remove the two-pass log files, even if a pass failed, plus any
+        # partial output left behind by a cancelled/failed encode.
         for f in APP_DIR.glob(f"passlog_{job_id}*"):
             try:
                 f.unlink()
+            except OSError:
+                pass
+        if job.get("status") in ("cancelled", "error"):
+            try:
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
             except OSError:
                 pass
 
@@ -381,6 +620,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     --amber: #d9aa5e;
     --radius: 12px;
     --radius-sm: 9px;
+    --ease: cubic-bezier(0.23, 1, 0.32, 1);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
@@ -392,8 +632,21 @@ PAGE_HTML = r"""<!DOCTYPE html>
     font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
     font-size: 14px;
     overflow: hidden;
+    display: flex; flex-direction: column;
   }
   button { font-family: inherit; cursor: pointer; }
+  button:active { transform: scale(0.97); }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 
   /* ---------- top bar ---------- */
   .topbar {
@@ -443,9 +696,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .icon-btn:hover { color: var(--text); border-color: var(--accent-dim); }
 
   /* ---------- layout ---------- */
+  /* flex:1 + min-height:0 (instead of a hardcoded 100vh calc) means the
+     warning banner can appear above without pushing the sidebar's export
+     button below the viewport. */
   .layout {
     display: grid; grid-template-columns: 1fr 340px;
-    height: calc(100vh - 56px);
+    flex: 1; min-height: 0;
   }
   .main {
     display: flex; flex-direction: column;
@@ -467,7 +723,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     border-radius: var(--radius); display: flex;
     flex-direction: column; align-items: center; justify-content: center;
     gap: 8px; cursor: pointer; background: var(--panel);
-    transition: border-color .15s, background .15s;
+    transition: border-color .15s var(--ease), background .15s var(--ease);
   }
   .dropzone:hover, .dropzone.over {
     border-color: var(--accent); background: var(--panel-2); }
@@ -495,7 +751,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0;
     background: rgba(255,255,255,.95); border: none; color: #111;
     font-size: 15px; display: flex; align-items: center;
-    justify-content: center; transition: transform .1s;
+    justify-content: center; transition: transform .12s var(--ease);
   }
   .play-btn:hover { transform: scale(1.06); }
   .ts {
@@ -526,7 +782,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
     gap: 16px; background: rgba(6,7,10,.82);
     backdrop-filter: blur(2px);
   }
-  .export-overlay.show { display: flex; }
+  .export-overlay.show { display: flex;
+    animation: rise .18s var(--ease); }
+  .eo-cancel {
+    margin-top: 4px; padding: 9px 18px; font-size: 12.5px; font-weight: 600;
+    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.22);
+    border-radius: var(--radius-sm); color: var(--text); letter-spacing: .2px;
+    transition: background .15s var(--ease), border-color .15s var(--ease);
+  }
+  .eo-cancel:hover { background: rgba(217,138,138,.18);
+    border-color: var(--red-dim); color: var(--red); }
   .export-overlay .eo-label {
     font-size: 13px; color: var(--text); font-weight: 600;
     letter-spacing: .3px;
@@ -539,7 +804,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .eo-fill {
     height: 100%; width: 0%; border-radius: 6px;
     background: linear-gradient(90deg, var(--accent), var(--green));
-    transition: width .35s ease;
+    transition: width .25s var(--ease);
   }
   .eo-pct { font-size: 26px; font-weight: 700;
     font-variant-numeric: tabular-nums; }
@@ -588,7 +853,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .tl-ruler .tk.maj { height: 10px; opacity: .7; }
   .tl-ruler .lb {
     position: absolute; bottom: 12px; transform: translateX(-50%);
-    font-size: 10px; color: var(--muted-2);
+    font-size: 11px; color: var(--muted-2);
     font-variant-numeric: tabular-nums; white-space: nowrap;
   }
   .tl-track {
@@ -642,7 +907,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
   /* ---------- sidebar sections ---------- */
   .sec-title {
-    font-size: 10.5px; font-weight: 700; letter-spacing: 1.2px;
+    font-size: 11px; font-weight: 700; letter-spacing: 1.2px;
     color: var(--muted-2); text-transform: uppercase;
     display: flex; justify-content: space-between; align-items: baseline;
   }
@@ -658,7 +923,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     border-radius: var(--radius-sm); padding: 10px 11px;
     text-align: left; color: var(--text);
     display: flex; flex-direction: column; gap: 3px;
-    transition: border-color .12s, background .12s;
+    transition: border-color .12s var(--ease), background .12s var(--ease);
   }
   .preset:hover { border-color: var(--accent-dim); }
   .preset.active {
@@ -690,7 +955,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     border-radius: var(--radius-sm); padding: 9px 10px;
   }
   .trim-row .tag {
-    font-size: 10px; font-weight: 700; letter-spacing: .6px;
+    font-size: 11px; font-weight: 700; letter-spacing: .6px;
     padding: 3px 7px; border-radius: 5px;
   }
   .trim-row.in  { border-left: 3px solid var(--green); }
@@ -709,7 +974,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
   .nudge:hover { border-color: var(--accent-dim); }
   .nudge.set { width: auto; padding: 0 7px; }
-  .nudge.set kbd { padding: 1px 4px; min-width: 15px; font-size: 10px;
+  .nudge.set kbd { padding: 1px 4px; min-width: 15px; font-size: 11px;
     border-bottom-width: 1px; }
 
   .length-row {
@@ -788,7 +1053,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   }
   .br-scale {
     display: flex; justify-content: space-between;
-    font-size: 10px; color: var(--muted-2); margin-top: 5px;
+    font-size: 11px; color: var(--muted-2); margin-top: 5px;
   }
 
   /* main action */
@@ -799,11 +1064,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
     background: linear-gradient(135deg, var(--accent), #bb9bb0);
     display: flex; align-items: center; justify-content: center; gap: 9px;
     box-shadow: 0 4px 16px rgba(162,136,166,.25);
-    transition: transform .1s, box-shadow .15s, filter .15s;
+    transition: transform .1s var(--ease), box-shadow .15s var(--ease),
+      filter .15s var(--ease);
   }
   .go-btn:hover { filter: brightness(1.05);
     box-shadow: 0 6px 22px rgba(162,136,166,.34); }
-  .go-btn:active { transform: translateY(1px); }
+  .go-btn:active { transform: scale(0.97); }
   .go-btn:disabled { filter: grayscale(.7) brightness(.7);
     box-shadow: none; cursor: not-allowed; }
   .go-btn kbd { background: rgba(28,29,33,.18); border-color: rgba(28,29,33,.32);
@@ -817,7 +1083,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
     background: var(--panel-2); border: 1px solid var(--line);
     color: var(--muted); letter-spacing: .2px;
     display: flex; align-items: center; justify-content: center; gap: 8px;
-    transition: border-color .15s, color .15s, background .15s;
+    transition: border-color .15s var(--ease), color .15s var(--ease),
+      background .15s var(--ease);
   }
   .reset-btn:hover {
     color: var(--text); border-color: var(--muted-2);
@@ -829,19 +1096,37 @@ PAGE_HTML = r"""<!DOCTYPE html>
     white-space: pre-wrap; display: none; line-height: 1.5;
     font-variant-numeric: tabular-nums;
   }
-  .toast.show { display: block; }
+  .toast.show { display: block; animation: rise .18s var(--ease); }
   .toast.ok  { background: rgba(133,183,154,.12);
     border: 1px solid var(--green-dim); color: #cfe3d5; }
   .toast.err { background: rgba(217,138,138,.12);
     border: 1px solid var(--red-dim); color: #eed3d3; }
+  .toast-action {
+    display: block; margin-top: 9px; padding: 7px 12px;
+    background: rgba(133,183,154,.16); border: 1px solid var(--green-dim);
+    border-radius: 7px; color: var(--green); font-size: 12px;
+    font-weight: 600;
+    transition: background .15s var(--ease), border-color .15s var(--ease);
+  }
+  .toast-action:hover { background: rgba(133,183,154,.26);
+    border-color: var(--green); }
 
   .warn-banner {
     margin: 12px 18px 0; background: rgba(217,170,94,.10);
     border: 1px solid #6b5631; color: #e8d3a8;
     padding: 10px 13px; border-radius: var(--radius-sm);
-    font-size: 12.5px; display: none;
+    font-size: 12.5px; display: none; flex-shrink: 0;
   }
-  .warn-banner.show { display: block; }
+  .warn-banner.show { display: block; animation: rise .18s var(--ease); }
+  .warn-banner .dl-bar {
+    height: 5px; border-radius: 3px; background: rgba(217,170,94,.18);
+    margin-top: 8px; overflow: hidden; display: none;
+  }
+  .warn-banner .dl-bar.show { display: block; }
+  .warn-banner .dl-fill {
+    height: 100%; width: 0%; background: var(--amber); border-radius: 3px;
+    transition: width .25s var(--ease);
+  }
 
   .disabled-veil { opacity: .4; pointer-events: none; }
 </style>
@@ -857,10 +1142,19 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <span class="meta" id="fileMeta">—</span>
   </div>
   <div class="spacer"></div>
+  <div class="hotkey-legend" id="hotkeyLegend">
+    <kbd>I</kbd><kbd>O</kbd><span>in/out</span>
+    <kbd>←</kbd><kbd>→</kbd><span>frame</span>
+    <kbd>J</kbd><kbd>K</kbd><kbd>L</kbd><span>shuttle</span>
+    <kbd>Space</kbd><span>play</span>
+    <kbd>↵</kbd><span>export</span>
+  </div>
 </div>
 
 <div class="warn-banner" id="ffwarn">
-  FFmpeg was not found. Trimming will not work until it is installed.
+  <span id="ffwarnText">FFmpeg was not found. Trimming will not work until it
+  is installed.</span>
+  <div class="dl-bar" id="ffdlBar"><div class="dl-fill" id="ffdlFill"></div></div>
 </div>
 
 <div class="layout">
@@ -891,13 +1185,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
         <div class="eo-pct" id="eoPct">0%</div>
         <div class="eo-bar"><div class="eo-fill" id="eoFill"></div></div>
         <div class="eo-sub" id="eoSub">This can take a moment</div>
+        <button class="eo-cancel" id="eoCancel">✕ Cancel export</button>
       </div>
     </div>
 
     <div class="controls-row" id="controlsRow" style="display:none;">
       <div class="grow"></div>
-      <button class="mark-btn mark-in" id="setIn">⊢ SET IN</button>
-      <button class="mark-btn mark-out" id="setOut">SET OUT ⊣</button>
+      <button class="mark-btn mark-in" id="setIn">⊢ SET IN <kbd>I</kbd></button>
+      <button class="mark-btn mark-out" id="setOut"><kbd>O</kbd> SET OUT ⊣</button>
+      <button class="seg" id="previewBtn" title="Play the selection">
+        ▶ Preview</button>
       <div class="grow"></div>
     </div>
 
@@ -945,7 +1242,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="size-input-wrap">
         <input type="number" class="field" id="sizeInput"
-               value="10" min="1" step="1">
+               value="10" min="1" max="4096" step="1">
         <span class="unit">MB</span>
       </div>
     </div>
@@ -955,15 +1252,15 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <div class="trim-row in">
         <span class="tag">IN</span>
         <span class="tval" id="inVal">—</span>
-        <button class="nudge" data-nudge="in" data-d="-0.0334">−</button>
-        <button class="nudge" data-nudge="in" data-d="0.0334">+</button>
+        <button class="nudge" data-nudge="in" data-d="-1">−</button>
+        <button class="nudge" data-nudge="in" data-d="1">+</button>
         <button class="nudge set" id="setInSide">⊢ Set</button>
       </div>
       <div class="trim-row out">
         <span class="tag">OUT</span>
         <span class="tval" id="outVal">—</span>
-        <button class="nudge" data-nudge="out" data-d="-0.0334">−</button>
-        <button class="nudge" data-nudge="out" data-d="0.0334">+</button>
+        <button class="nudge" data-nudge="out" data-d="-1">−</button>
+        <button class="nudge" data-nudge="out" data-d="1">+</button>
         <button class="nudge set" id="setOutSide">Set ⊣</button>
       </div>
       <div class="length-row">
@@ -1009,7 +1306,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     </div>
 
     <button class="go-btn" id="exportBtn" disabled>
-      ⚡ Trim &amp; Compress
+      ⚡ Trim &amp; Compress <kbd>↵</kbd>
     </button>
 
     <button class="reset-btn" id="resetBtn" style="display:none;">
@@ -1022,12 +1319,20 @@ PAGE_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const FFMPEG_READY = __FFMPEG_READY__;
+let FFMPEG_READY = __FFMPEG_READY__;
 const TOKEN = "__TOKEN__";
 
 // Append the per-session token to a request path so the server accepts it.
+// Only used where a URL is unavoidable (the <video> src); fetch requests
+// send the token as a header instead so it stays out of URLs and logs.
 function api(path) {
   return path + (path.includes('?') ? '&' : '?') + 'token=' + TOKEN;
+}
+function jfetch(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({'X-ClipTrimmer-Token': TOKEN},
+    opts.headers || {});
+  return fetch(path, opts);
 }
 
 // ---------- element refs ----------
@@ -1037,15 +1342,43 @@ let serverPath = null;
 let inPoint = null, outPoint = null;
 let pollTimer = null;
 let exporting = false;
-const FRAME = 0.0334;   // ~1 frame at 30fps, used for nudges
+let currentJob = null;
+let FRAME = 1 / 30;   // one frame; replaced by the real fps after upload
 
-if (!FFMPEG_READY) $('ffwarn').classList.add('show');
+// ---------- first-run FFmpeg download progress ----------
+if (!FFMPEG_READY) {
+  $('ffwarn').classList.add('show');
+  const ffPoll = setInterval(() => {
+    jfetch('/ffstatus').then(r => r.json()).then(j => {
+      if (j.ready) {
+        clearInterval(ffPoll);
+        FFMPEG_READY = true;
+        $('ffwarn').classList.remove('show');
+        if (serverPath && !exporting) $('exportBtn').disabled = false;
+        return;
+      }
+      if (j.status === 'downloading' || j.status === 'extracting') {
+        $('ffwarnText').textContent =
+          j.message || 'Setting up FFmpeg (one-time, ~25 MB)…';
+        $('ffdlBar').classList.add('show');
+        $('ffdlFill').style.width = (j.progress || 0) + '%';
+      } else if (j.status === 'error') {
+        clearInterval(ffPoll);
+        $('ffdlBar').classList.remove('show');
+        $('ffwarnText').textContent = j.message ||
+          'FFmpeg setup failed. Install it from ffmpeg.org and restart.';
+      }
+    }).catch(() => {});
+  }, 700);
+}
 
 // ---------- helpers ----------
 function fmt(t) {
   if (t == null || isNaN(t)) return '—';
-  const m = Math.floor(t / 60);
-  const s = (t % 60).toFixed(2).padStart(5, '0');
+  // round to centiseconds FIRST so 59.999 doesn't render as "0:60.00"
+  const cs = Math.round(t * 100);
+  const m = Math.floor(cs / 6000);
+  const s = ((cs % 6000) / 100).toFixed(2).padStart(5, '0');
   return m + ':' + s;
 }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
@@ -1064,15 +1397,34 @@ $('fileInput').addEventListener('change', e => {
   if (e.target.files.length) loadFile(e.target.files[0]);
 });
 
+function uploadWithProgress(file) {
+  // XHR (not fetch) so we get upload progress events for big clips.
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload?name=' + encodeURIComponent(file.name));
+    xhr.setRequestHeader('X-ClipTrimmer-Token', TOKEN);
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable)
+        showToast('Loading video… ' +
+          Math.round(e.loaded / e.total * 100) + '%', '');
+    };
+    xhr.onload = () => {
+      try {
+        if (xhr.status !== 200) throw new Error('HTTP ' + xhr.status);
+        resolve(JSON.parse(xhr.responseText));
+      } catch (err) { reject(err); }
+    };
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.send(file);
+  });
+}
+
 function loadFile(file) {
-  showToast('Loading video…', '');
-  // Stream the file straight as the request body (the browser streams it, so
-  // nothing huge is held in memory on either side); the name rides in the URL.
-  fetch(api('/upload?name=' + encodeURIComponent(file.name)),
-        { method: 'POST', body: file })
-    .then(r => r.json())
+  showToast('Loading video… 0%', '');
+  uploadWithProgress(file)
     .then(info => {
       serverPath = info.path;
+      FRAME = 1 / (info.fps || 30);
       video.src = api('/video?path=' + encodeURIComponent(info.path));
       $('fileName').textContent = file.name;
       const mb = (file.size / 1048576).toFixed(1);
@@ -1085,7 +1437,8 @@ function loadFile(file) {
       $('exportBtn').disabled = !FFMPEG_READY;
       hideToast();
       video.addEventListener('loadedmetadata', () => {
-        $('fileMeta').textContent = fmt(video.duration) + '  ·  ' + mb + ' MB';
+        $('fileMeta').textContent = fmt(video.duration) + '  ·  ' + mb +
+          ' MB  ·  ' + Math.round(info.fps || 30) + ' fps';
         $('totTime').textContent = fmt(video.duration);
         buildTicks();
         updateBitrate();
@@ -1220,17 +1573,23 @@ $('setOutSide').addEventListener('click', setOutPoint);
 
 function setInPoint() {
   inPoint = video.currentTime;
-  if (outPoint != null && inPoint >= outPoint) outPoint = null;
+  if (outPoint != null && inPoint >= outPoint) {
+    outPoint = null;
+    showToast('OUT point cleared - it was before the new IN point.', '');
+  }
   refreshMarks();
 }
 function setOutPoint() {
   outPoint = video.currentTime;
-  if (inPoint != null && outPoint <= inPoint) inPoint = null;
+  if (inPoint != null && outPoint <= inPoint) {
+    inPoint = null;
+    showToast('IN point cleared - it was after the new OUT point.', '');
+  }
   refreshMarks();
 }
 document.querySelectorAll('[data-nudge]').forEach(b => {
   b.addEventListener('click', () => {
-    const d = parseFloat(b.dataset.d);
+    const d = parseFloat(b.dataset.d) * FRAME;   // data-d is in frames
     if (b.dataset.nudge === 'in' && inPoint != null)
       inPoint = clamp(inPoint + d, 0, (outPoint ?? video.duration));
     if (b.dataset.nudge === 'out' && outPoint != null)
@@ -1325,8 +1684,12 @@ function updateBitrate() {
   if (keepAudio) audioKbps = activeSize <= 4 ? 96
     : activeSize <= 8 ? 128 : 160;
   let videoKbps = Math.floor((totalKbits / len - audioKbps) * 0.97);
+  const MAX_KBPS = 40000;   // mirrors the backend cap
+  const capped = videoKbps > MAX_KBPS;
+  if (capped) videoKbps = MAX_KBPS;
   $('brVal').textContent = videoKbps > 0
-    ? videoKbps.toLocaleString() + ' kbps' : 'too small';
+    ? videoKbps.toLocaleString() + (capped ? ' kbps (max)' : ' kbps')
+    : 'too small';
   // map bitrate onto the meter: 0..8000 kbps -> 0..100%
   const q = clamp(videoKbps / 8000, 0, 1);
   $('brMask').style.width = ((1 - q) * 100) + '%';
@@ -1337,13 +1700,13 @@ function setFolder(p) {
   $('outFolder').textContent = p;
   $('outFolder').title = p;
 }
-fetch(api('/outdir')).then(r => r.json()).then(j => setFolder(j.folder))
+jfetch('/outdir').then(r => r.json()).then(j => setFolder(j.folder))
   .catch(() => {});
 $('chooseFolder').addEventListener('click', () => {
   const b = $('chooseFolder');
   b.disabled = true; b.textContent = '…';
-  fetch(api('/pickfolder')).then(r => r.json())
-    .then(j => setFolder(j.folder))
+  jfetch('/pickfolder').then(r => r.json())
+    .then(j => { if (!j.busy) setFolder(j.folder); })
     .catch(() => {})
     .finally(() => { b.disabled = false; b.textContent = '📁'; });
 });
@@ -1354,18 +1717,23 @@ function startExport() {
   if (exporting || !FFMPEG_READY || !serverPath) return;
   const start = inPoint != null ? inPoint : 0;
   const end   = outPoint != null ? outPoint : video.duration;
-  if (!end || end - start < 0.1) {
-    showToast('Set valid In and Out points first.', 'err'); return;
+  if (!end || isNaN(end)) {
+    showToast('Wait for the video to finish loading first.', 'err'); return;
   }
-  if (!activeSize || activeSize < 1) {
-    showToast('Enter a target size of at least 1 MB.', 'err'); return;
+  if (end - start < 0.1) {
+    showToast('Selection is too short - it must be at least 0.1 seconds. ' +
+      'Adjust your IN/OUT points.', 'err');
+    return;
+  }
+  if (!activeSize || activeSize < 1 || activeSize > 4096) {
+    showToast('Enter a target size between 1 and 4096 MB.', 'err'); return;
   }
   exporting = true;
   $('exportBtn').disabled = true;
   hideToast();
   showOverlay(0, 'Starting…');
 
-  fetch(api('/export'), {
+  jfetch('/export', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ path: serverPath, start, end,
       target_mb: activeSize, resolution:
@@ -1373,28 +1741,45 @@ function startExport() {
       keep_audio: keepAudio })
   })
   .then(r => r.json())
-  .then(j => { if (j.job) poll(j.job);
+  .then(j => { if (j.job) { currentJob = j.job; poll(j.job); }
     else throw new Error(j.error || 'failed'); })
   .catch(err => { endExport(); showToast('Export failed: ' + err, 'err'); });
 }
 
+// Cancel a running export from the overlay.
+$('eoCancel').addEventListener('click', () => {
+  if (!currentJob) return;
+  $('eoCancel').disabled = true;
+  jfetch('/cancel?job=' + currentJob, { method: 'POST' }).catch(() => {});
+});
+
+// Warn before closing the window while an export is running (the server
+// also refuses to die mid-encode, but this stops the accidental close).
+window.addEventListener('beforeunload', e => {
+  if (exporting) { e.preventDefault(); e.returnValue = ''; }
+});
+
 function poll(jobId) {
   clearInterval(pollTimer);
   pollTimer = setInterval(() => {
-    fetch(api('/status?job=' + jobId)).then(r => r.json()).then(j => {
+    jfetch('/status?job=' + jobId).then(r => r.json()).then(j => {
       if (typeof j.progress === 'number')
         showOverlay(j.progress, j.message || 'Encoding…');
       if (j.status === 'done') {
         clearInterval(pollTimer);
         showOverlay(100, 'Done');
         setTimeout(() => { endExport();
-          showToast(j.message, 'ok'); }, 600);
+          showToast(j.message, 'ok', jobId); }, 600);
       } else if (j.status === 'error') {
         clearInterval(pollTimer);
         endExport();
         showToast(j.message, 'err');
+      } else if (j.status === 'cancelled') {
+        clearInterval(pollTimer);
+        endExport();
+        showToast('Export cancelled.', '');
       }
-    });
+    }).catch(() => { /* transient network blip - keep polling */ });
   }, 500);
 }
 
@@ -1408,27 +1793,51 @@ function showOverlay(pct, label) {
 }
 function endExport() {
   exporting = false;
+  currentJob = null;
+  $('eoCancel').disabled = false;
   $('exportOverlay').classList.remove('show');
   $('exportBtn').disabled = !FFMPEG_READY;
 }
 
 // ---------- toast ----------
-function showToast(msg, kind) {
+// showToast(msg, kind, doneJobId): when doneJobId is given, the toast gets
+// an "Open folder" action that reveals the exported file in Explorer.
+function showToast(msg, kind, doneJobId) {
   const t = $('toast');
   t.textContent = msg;
   t.className = 'toast show' + (kind ? ' ' + kind : '');
+  if (doneJobId) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = '📂 Open folder';
+    btn.addEventListener('click', () => {
+      jfetch('/openfolder?job=' + doneJobId, { method: 'POST' })
+        .catch(() => {});
+    });
+    t.appendChild(btn);
+  }
 }
 function hideToast() { $('toast').className = 'toast'; }
 
 // ---------- reset / load a new clip ----------
 $('resetBtn').addEventListener('click', resetApp);
 function resetApp() {
+  if (exporting) {
+    showToast('An export is running - cancel it before resetting.', 'err');
+    return;
+  }
+  // Trim points can't be recovered after a reset, so confirm first.
+  if ((inPoint != null || outPoint != null) &&
+      !confirm('Load a new clip? Your current trim points will be lost.'))
+    return;
   try { video.pause(); } catch (e) {}
   video.removeAttribute('src');
   video.load();
   serverPath = null;
   inPoint = null;
   outPoint = null;
+  FRAME = 1 / 30;
+  previewStop = null;
   $('fileInput').value = '';
   $('fileChip').style.display = 'none';
   $('stage').style.display = 'none';
@@ -1441,13 +1850,85 @@ function resetApp() {
   refreshMarks();
 }
 
-// ---------- the one hotkey: Space = play / pause ----------
+// ---------- selection preview (plays IN -> OUT, then pauses) ----------
+let previewStop = null;   // out-time to auto-pause at, or null
+$('previewBtn').addEventListener('click', playPreview);
+function playPreview() {
+  if (!video.duration) return;
+  const start = inPoint != null ? inPoint : 0;
+  const end = outPoint != null ? outPoint : video.duration;
+  if (end - start < 0.05) {
+    showToast('Set IN and OUT points to preview the selection.', '');
+    return;
+  }
+  previewStop = end;
+  video.currentTime = start;
+  video.play();
+}
+video.addEventListener('timeupdate', () => {
+  if (previewStop != null && video.currentTime >= previewStop) {
+    video.pause();
+    video.currentTime = previewStop;
+    previewStop = null;
+  }
+});
+// any manual pause/seek ends preview mode
+video.addEventListener('pause', () => { previewStop = null; });
+
+// ---------- keyboard shortcuts ----------
+// Space play/pause · I/O set in/out · arrows frame-step (Shift = 1s) ·
+// J/K/L shuttle · Enter export
+let shuttleRate = 1;
+function frameStep(dir, big) {
+  if (!video.duration) return;
+  video.pause();
+  const step = big ? 1 : FRAME;
+  video.currentTime = clamp(video.currentTime + dir * step, 0, video.duration);
+}
 document.addEventListener('keydown', e => {
-  if (e.code !== 'Space' && e.key !== ' ') return;
   const t = e.target.tagName;
   if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
-  e.preventDefault();          // stop page scroll + avoid double-firing a focused button
-  if (video.src) togglePlay();
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const hasVideo = !!video.src;
+  switch (e.code) {
+    case 'Space':
+      e.preventDefault();
+      if (hasVideo) { shuttleRate = 1; video.playbackRate = 1; togglePlay(); }
+      break;
+    case 'KeyI':
+      if (hasVideo) { e.preventDefault(); setInPoint(); }
+      break;
+    case 'KeyO':
+      if (hasVideo) { e.preventDefault(); setOutPoint(); }
+      break;
+    case 'ArrowLeft':
+      if (hasVideo) { e.preventDefault(); frameStep(-1, e.shiftKey); }
+      break;
+    case 'ArrowRight':
+      if (hasVideo) { e.preventDefault(); frameStep(1, e.shiftKey); }
+      break;
+    case 'KeyJ':   // step/jump back; repeated presses jump further back
+      if (hasVideo) { e.preventDefault();
+        shuttleRate = 1; video.playbackRate = 1;
+        video.currentTime = clamp(video.currentTime - 1, 0, video.duration); }
+      break;
+    case 'KeyK':   // pause + reset speed
+      if (hasVideo) { e.preventDefault();
+        shuttleRate = 1; video.playbackRate = 1; video.pause(); }
+      break;
+    case 'KeyL':   // play; repeated presses speed up 1x -> 2x -> 4x
+      if (hasVideo) { e.preventDefault();
+        if (video.paused) { shuttleRate = 1; }
+        else { shuttleRate = Math.min(shuttleRate * 2, 4); }
+        video.playbackRate = shuttleRate;
+        video.play(); }
+      break;
+    case 'Enter':
+      if (hasVideo && !exporting && !$('exportBtn').disabled) {
+        e.preventDefault(); startExport();
+      }
+      break;
+  }
 });
 
 // ---------- keep-alive heartbeat ----------
@@ -1480,14 +1961,20 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, str):
             body = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # client went away mid-response; nothing to do
 
     def _authed(self, parsed):
-        """Every endpoint except the entry page requires the session token."""
+        """Every endpoint except the entry page requires the session token,
+        via header (preferred - keeps it out of URLs) or query string."""
+        if self.headers.get("X-ClipTrimmer-Token") == TOKEN:
+            return True
         return parse_qs(parsed.query).get("token", [""])[0] == TOKEN
 
     def _host_ok(self):
@@ -1522,8 +2009,16 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/status":
             qs = parse_qs(parsed.query)
             job_id = qs.get("job", [""])[0]
-            job = JOBS.get(job_id, {"status": "error", "message": "Unknown job"})
+            job = JOBS.get(job_id)
+            if not isinstance(job, dict):
+                job = {"status": "error", "message": "Unknown job"}
             self._send(200, json.dumps(job))
+            return
+
+        if parsed.path == "/ffstatus":
+            # First-run FFmpeg download progress for the UI banner.
+            self._send(200, json.dumps({
+                "ready": bool(FFMPEG and FFPROBE), **FF_STATE}))
             return
 
         if parsed.path == "/outdir":
@@ -1533,10 +2028,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/pickfolder":
             # Open a native folder dialog (blocks until the user picks/cancels).
-            chosen = pick_output_folder()
+            # A second request while one is open returns busy immediately.
+            chosen, busy = pick_output_folder()
             if chosen:
                 OUTPUT_DIR[0] = chosen
-            self._send(200, json.dumps({"folder": OUTPUT_DIR[0]}))
+            self._send(200, json.dumps({"folder": OUTPUT_DIR[0],
+                                        "busy": busy}))
             return
 
         if parsed.path == "/alive":
@@ -1574,9 +2071,38 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/export":
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length) or b"")
+            except (ValueError, json.JSONDecodeError):
+                self._send(400, json.dumps(
+                    {"error": "Request body must be valid JSON."}))
+                return
             self._handle_export(data)
+            return
+
+        if parsed.path == "/cancel":
+            job_id = parse_qs(parsed.query).get("job", [""])[0]
+            ok = cancel_export(job_id)
+            self._send(200 if ok else 404,
+                       json.dumps({"ok": ok} if ok
+                                  else {"error": "No running job to cancel."}))
+            return
+
+        if parsed.path == "/openfolder":
+            # Reveal the finished export in Explorer. The path comes from our
+            # own job record, never from the client.
+            job_id = parse_qs(parsed.query).get("job", [""])[0]
+            job = JOBS.get(job_id)
+            out = job.get("output") if isinstance(job, dict) else None
+            if out and os.path.isfile(out) and os.name == "nt":
+                try:
+                    subprocess.Popen(["explorer", "/select,", out])
+                    self._send(200, json.dumps({"ok": True}))
+                    return
+                except Exception:
+                    pass
+            self._send(404, json.dumps({"error": "Output file not found."}))
             return
 
         self._send(404, json.dumps({"error": "not found"}))
@@ -1598,23 +2124,32 @@ class Handler(BaseHTTPRequestHandler):
         path = real
         size = os.path.getsize(path)
         range_hdr = self.headers.get("Range")
-        start, end = 0, size - 1
-        if range_hdr and range_hdr.startswith("bytes="):
-            rng = range_hdr.split("=", 1)[1].split("-")
-            if rng[0]:
-                start = int(rng[0])
-            if len(rng) > 1 and rng[1]:
-                end = int(rng[1])
-        end = min(end, size - 1)
+        try:
+            rng = parse_range_header(range_hdr, size)
+        except ValueError:
+            # Syntactically valid but unsatisfiable range -> proper 416.
+            try:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except OSError:
+                pass
+            return
+        partial = rng is not None
+        start, end = rng if partial else (0, size - 1)
         length = end - start + 1
 
-        self.send_response(206 if range_hdr else 200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(length))
-        if range_hdr:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.end_headers()
+        try:
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", guess_video_mime(path))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+        except OSError:
+            return
 
         with open(path, "rb") as f:
             f.seek(start)
@@ -1666,29 +2201,36 @@ class Handler(BaseHTTPRequestHandler):
 
         # remember the original name so we can name the output sensibly
         JOBS["_last_name"] = safe_name
-        self._send(200, json.dumps({"path": str(temp_path)}))
+        # Detect the real frame rate so frame-step nudges are accurate for
+        # 60/120/144 fps captures (falls back to 30 if ffprobe is missing).
+        fps = probe_fps(temp_path)
+        self._send(200, json.dumps({"path": str(temp_path), "fps": fps}))
 
     # -- kick off a background export job --
     def _handle_export(self, data):
         if not (FFMPEG and FFPROBE):
-            self._send(200, json.dumps({"error": "FFmpeg not available"}))
+            self._send(503, json.dumps({"error": "FFmpeg not available"}))
+            return
+        params, err = validate_export_request(data)
+        if err:
+            self._send(400, json.dumps({"error": err}))
             return
         # Only transcode files from our own temp dir (the uploaded clip), never
         # an arbitrary path supplied in the request.
-        src = data.get("path", "")
+        src = data.get("path", "") if isinstance(data.get("path"), str) else ""
         real_src = os.path.realpath(src) if src else ""
         base = os.path.realpath(str(APP_DIR))
         inside = real_src == base or real_src.startswith(base + os.sep)
         if not inside or not os.path.isfile(real_src):
-            self._send(200, json.dumps({"error": "source file missing"}))
+            self._send(400, json.dumps({"error": "source file missing"}))
             return
         src = real_src
 
-        start = float(data["start"])
-        end = float(data["end"])
-        target_mb = float(data["target_mb"])
-        resolution = int(data.get("resolution", 0))
-        keep_audio = bool(data.get("keep_audio", True))
+        start = params["start"]
+        end = params["end"]
+        target_mb = params["target_mb"]
+        resolution = params["resolution"]
+        keep_audio = params["keep_audio"]
 
         # Build an output path inside the user-chosen output folder. Falls back
         # to the default if that folder somehow no longer exists.
@@ -1707,8 +2249,9 @@ class Handler(BaseHTTPRequestHandler):
 
         JOB_COUNTER[0] += 1
         job_id = str(JOB_COUNTER[0])
-        JOBS[job_id] = {"status": "queued", "message": "Queued...",
-                        "progress": 0.0}
+        prune_jobs(JOBS)   # keep the finished-job history bounded
+        JOBS[job_id] = {"id": job_id, "status": "queued",
+                        "message": "Queued...", "progress": 0.0}
 
         threading.Thread(
             target=run_export,
@@ -1724,8 +2267,27 @@ class Handler(BaseHTTPRequestHandler):
 # Startup
 # ----------------------------------------------------------------------------
 def _start_server():
-    """Start the local HTTP server in a background thread and return it."""
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    """
+    Start the local HTTP server in a background thread and return it.
+    Binds directly, retrying on successive ports (no probe-then-bind race).
+    """
+    global PORT
+    server = None
+    last_err = None
+    for offset in range(40):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 8731 + offset), Handler)
+            PORT = 8731 + offset
+            break
+        except OSError as e:
+            last_err = e
+    if server is None:
+        # last resort: let the OS choose any free port
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            PORT = server.server_address[1]
+        except OSError:
+            raise last_err
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return server
@@ -1819,6 +2381,14 @@ def _watchdog(server):
         limit = HIDDEN_TIMEOUT if LIFE["hidden"] else VISIBLE_TIMEOUT
         if now - LIFE["last_ping"] > limit:
             break
+    # Never kill a running export: if an encode is still in flight when the
+    # window goes away, let it finish (with a generous safety cap) so the
+    # user doesn't get a truncated _trimmed.mp4 and stale passlog files.
+    EXPORT_GRACE = 30 * 60
+    deadline = time.time() + EXPORT_GRACE
+    while export_active(JOBS) and time.time() < deadline:
+        print("Window closed but an export is still running - waiting...")
+        time.sleep(2)
     try:
         server.shutdown()
     except Exception:
@@ -1826,19 +2396,30 @@ def _watchdog(server):
     os._exit(0)
 
 
-def main():
+def _ffmpeg_setup_thread():
+    """First-run FFmpeg download, run in the background AFTER the server is
+    up so the UI can show live progress instead of a silent blocked launch."""
     global FFMPEG, FFPROBE
-
+    if FFMPEG and FFPROBE:
+        FF_STATE.update(status="ready", progress=100)
+        return
+    if os.name == "nt":
+        if download_ffmpeg():
+            FFMPEG, FFPROBE = find_ffmpeg()
     if not (FFMPEG and FFPROBE):
-        if os.name == "nt":
-            ok = download_ffmpeg()
-            if ok:
-                FFMPEG, FFPROBE = find_ffmpeg()
-        if not (FFMPEG and FFPROBE):
-            print("WARNING: FFmpeg not found. Trimming/compression will not work.")
-            print("Install FFmpeg from https://ffmpeg.org and restart.")
+        if FF_STATE["status"] != "error":
+            FF_STATE.update(status="error",
+                            message="FFmpeg not found. Install it from "
+                                    "https://ffmpeg.org and restart.")
+        print("WARNING: FFmpeg not found. Trimming/compression will not work.")
+        print("Install FFmpeg from https://ffmpeg.org and restart.")
 
+
+def main():
+    # Start the server and open the window immediately; the (possibly slow)
+    # first-run FFmpeg download happens in the background with UI progress.
     server = _start_server()
+    threading.Thread(target=_ffmpeg_setup_thread, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}/"
     print("=" * 52)
     print("  Clip Trimmer is running.")

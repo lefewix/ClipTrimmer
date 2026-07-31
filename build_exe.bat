@@ -5,7 +5,11 @@ REM
 REM  Double-click this file. It will:
 REM    1. Make sure PyInstaller is installed
 REM    2. Download FFmpeg and bundle it INSIDE the exe (fully offline result)
-REM    3. Produce ClipTrimmer.exe in this same folder (no console window)
+REM    3. Produce dist\ClipTrimmer\ClipTrimmer.exe (--onedir, no console window)
+REM
+REM  --onedir is used deliberately: a --onefile build re-extracts ~100 MB to a
+REM  temp folder on every launch, which is slow and wastes disk. Ship the whole
+REM  dist\ClipTrimmer folder.
 REM
 REM  Requirements: Python 3.8+ installed and on PATH, plus internet (build time).
 REM  The finished ClipTrimmer.exe needs neither Python nor internet to run.
@@ -39,7 +43,8 @@ echo [1/5] Using Python: %PY%
 REM ---- 2. Install / update PyInstaller ---------------------------------------
 echo.
 echo [2/5] Installing PyInstaller...
-%PY% -m pip install --upgrade --quiet pip
+REM  NOTE: we deliberately do NOT run "pip install --upgrade pip" here - that
+REM  mutates the user's global Python install as a side effect of a build.
 %PY% -m pip install --upgrade --quiet pyinstaller
 if errorlevel 1 (
   echo [ERROR] Could not install PyInstaller via pip.
@@ -95,12 +100,13 @@ echo.
 echo [4/5] Compiling ClipTrimmer.exe ... (full log -^> build_log.txt)
 set "LOG=%~dp0build_log.txt"
 %PY% -m PyInstaller ^
-  --onefile ^
+  --onedir ^
+  --noconfirm ^
   --noconsole ^
   --name ClipTrimmer ^
   --add-data "%~dp0ffmpeg\ffmpeg.exe;ffmpeg" ^
   --add-data "%~dp0ffmpeg\ffprobe.exe;ffmpeg" ^
-  --distpath "%~dp0." ^
+  --distpath "%~dp0dist" ^
   --workpath "%TEMP%\cliptrimmer_build" ^
   --specpath "%TEMP%\cliptrimmer_build" ^
   "%~dp0ClipTrimmer.pyw"  > "%LOG%" 2>&1
@@ -118,13 +124,14 @@ if exist "ffmpeg" rmdir /s /q "ffmpeg"
 if exist "%TEMP%\cliptrimmer_build" rmdir /s /q "%TEMP%\cliptrimmer_build"
 
 echo.
-if exist "ClipTrimmer.exe" (
+if exist "dist\ClipTrimmer\ClipTrimmer.exe" (
   echo ==========================================================
-  echo   SUCCESS  -  ClipTrimmer.exe is ready in this folder.
-  echo   Double-click it to run. No Python or internet needed.
+  echo   SUCCESS  -  dist\ClipTrimmer\ClipTrimmer.exe is ready.
+  echo   Keep the whole ClipTrimmer folder together and double-click
+  echo   the exe inside it. No Python or internet needed.
   echo ==========================================================
 ) else (
-  echo [ERROR] Build finished but ClipTrimmer.exe was not produced.
+  echo [ERROR] Build finished but dist\ClipTrimmer\ClipTrimmer.exe was not produced.
   goto :fail
 )
 echo.
