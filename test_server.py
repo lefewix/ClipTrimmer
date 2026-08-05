@@ -318,5 +318,105 @@ class TestGuessVideoMime(unittest.TestCase):
                          "video/x-matroska")
 
 
+# ------------------------------------------------------------- ffprobe parsing
+class TestParseProbeFields(unittest.TestCase):
+    def test_reads_key_value_lines(self):
+        self.assertEqual(
+            ct.parse_probe_fields("width=1920\nheight=1080\n"),
+            {"width": "1920", "height": "1080"})
+
+    def test_na_becomes_empty(self):
+        self.assertEqual(ct.parse_probe_fields("duration=N/A")["duration"], "")
+
+    def test_values_containing_equals_are_kept_whole(self):
+        # avg_frame_rate never looks like this, but tags do, and splitting on
+        # every "=" instead of the first would silently truncate them
+        self.assertEqual(
+            ct.parse_probe_fields("TAG:comment=a=b=c")["TAG:comment"], "a=b=c")
+
+    def test_fraction_values_survive(self):
+        self.assertEqual(
+            ct.parse_probe_fields("avg_frame_rate=30000/1001")
+            ["avg_frame_rate"], "30000/1001")
+
+    def test_malformed_lines_and_blanks_skipped(self):
+        self.assertEqual(
+            ct.parse_probe_fields("\nnonsense\nwidth=640\n\n"),
+            {"width": "640"})
+
+    def test_empty_and_none_input(self):
+        self.assertEqual(ct.parse_probe_fields(""), {})
+        self.assertEqual(ct.parse_probe_fields(None), {})
+
+    def test_whitespace_is_stripped(self):
+        self.assertEqual(ct.parse_probe_fields("  width = 800 \n"),
+                         {"width": "800"})
+
+
+# --------------------------------------------------------------- path guarding
+class TestPathInside(unittest.TestCase):
+    def setUp(self):
+        self.base = Path(ct.APP_DIR)
+
+    def test_file_in_base_is_allowed(self):
+        target = self.base / "source_clip.mp4"
+        self.assertEqual(ct.path_inside(str(target), self.base),
+                         os.path.realpath(str(target)))
+
+    def test_base_itself_is_allowed(self):
+        self.assertEqual(ct.path_inside(str(self.base), self.base),
+                         os.path.realpath(str(self.base)))
+
+    def test_traversal_is_rejected(self):
+        escape = self.base / ".." / ".." / "secrets.txt"
+        self.assertIsNone(ct.path_inside(str(escape), self.base))
+
+    def test_sibling_prefix_is_rejected(self):
+        # the string starts with the base path but names a different directory,
+        # which a bare startswith() check would wave through
+        self.assertIsNone(
+            ct.path_inside(str(self.base) + "_evil" + os.sep + "x.mp4",
+                           self.base))
+
+    def test_absolute_outside_path_is_rejected(self):
+        outside = ("C:\\Windows\\System32\\config\\SAM" if os.name == "nt"
+                   else "/etc/passwd")
+        self.assertIsNone(ct.path_inside(outside, self.base))
+
+    def test_empty_and_none_are_rejected(self):
+        self.assertIsNone(ct.path_inside("", self.base))
+        self.assertIsNone(ct.path_inside(None, self.base))
+
+
+# -------------------------------------------------------------- filmstrip math
+class TestFilmstripFilter(unittest.TestCase):
+    @staticmethod
+    def _rate(duration):
+        return float(
+            ct.filmstrip_filter(duration).split("fps=")[1].split(",")[0])
+
+    def test_tiles_the_requested_frame_count(self):
+        self.assertIn(f"tile={ct.FILMSTRIP_FRAMES}x1",
+                      ct.filmstrip_filter(60))
+
+    def test_scales_to_the_track_height(self):
+        self.assertIn(f"scale=-2:{ct.FILMSTRIP_HEIGHT}",
+                      ct.filmstrip_filter(60))
+
+    def test_rate_oversamples_so_tile_always_fills(self):
+        # tile only emits once it has a full row, so sampling exactly
+        # FILMSTRIP_FRAMES frames loses the whole strip when fps rounds down
+        self.assertGreater(self._rate(60) * 60, ct.FILMSTRIP_FRAMES)
+
+    def test_zero_and_negative_duration_do_not_divide_by_zero(self):
+        for bad in (0, -1, -0.0):
+            with self.subTest(duration=bad):
+                self.assertGreater(self._rate(bad), 0)
+
+    def test_long_clip_still_yields_a_positive_rate(self):
+        # a two-hour clip must not round its sample rate down to 0.000000
+        self.assertGreater(self._rate(7200), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
