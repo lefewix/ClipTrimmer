@@ -1,0 +1,3 @@
+PySide6_Essentials==6.12.0
+python-mpv==1.0.8
+pyinstaller==6.22.3

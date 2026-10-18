@@ -1,9 +1,7 @@
-# Build artifacts
+.venv/
 build/
 dist/
-*.spec
-build_log.txt
+bin/
 __pycache__/
-
-# Test clips
-*.mp4
+*.pyc
+build_log.txt
