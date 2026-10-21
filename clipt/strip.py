@@ -41,8 +41,13 @@ class Strip(QWidget):
         self.update()
 
     def set_position(self, t):
+        # At 120 fps the playhead moves well under a pixel per frame, and repainting
+        # the whole strip every frame cost ~8% CPU; only repaint when it reaches a new pixel.
+        r = self.devicePixelRatioF()
+        moved = round(self.x_of(t) * r) != round(self.x_of(self.pos) * r)
         self.pos = t
-        self.update()
+        if moved:
+            self.update()
 
     def clear_thumbs(self):
         self.thumbs = {}
