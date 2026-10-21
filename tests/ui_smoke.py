@@ -55,9 +55,16 @@ def wait_until(cond, timeout):
     return cond()
 
 
+def screen_grab(w):
+    """What's really on screen over a widget (mpv draws into its own native window,
+    which QWidget.grab() can't see)."""
+    top_left = w.mapToGlobal(QPoint(0, 0))
+    return w.screen().grabWindow(0, top_left.x(), top_left.y(), w.width(), w.height())
+
+
 def shot(name):
     pump(0.3)
-    win.grab().save(str(SHOTS / f"{name}.png"))
+    screen_grab(win).save(str(SHOTS / f"{name}.png"))
 
 
 def brightness(img):
@@ -142,7 +149,7 @@ check("header shows clip facts", "120 fps" in win.meta_label.text() and "1080p" 
 
 win.seek_to(5.0)
 pump(0.8)
-img = win.video.grabFramebuffer()
+img = screen_grab(win.video).toImage()
 check("video actually renders (not black)", brightness(img) > 40, f"avg {brightness(img):.0f}")
 shot("2_loaded")
 
@@ -173,6 +180,19 @@ pump(1.2)
 win.toggle_play()
 pump(0.3)
 check("Space/play advances time", 10.6 < win.pos < 11.8, f"{win.pos:.2f}")
+
+# ---- volume ----
+check("volume defaults to 100", win.volume.value() == 100 and win.player.mpv.volume == 100)
+win.volume.setValue(40)
+check("slider sets mpv volume", win.player.mpv.volume == 40, win.player.mpv.volume)
+QTest.keyClick(win, Qt.Key.Key_M)
+check("M mutes", win.player.mpv.mute is True)
+QTest.keyClick(win, Qt.Key.Key_Up)
+check("Up raises volume and unmutes", win.volume.value() == 50 and win.player.mpv.mute is False)
+QTest.keyClick(win, Qt.Key.Key_Down)
+check("Down lowers volume", win.volume.value() == 40)
+check("volume is remembered", int(QSettings().value("volume")) == 40)
+win.volume.setValue(100)
 win.play_section(0)
 check("play section stops at its OUT",
       wait_until(lambda: win.paused and abs(win.pos - 8.0) < 0.05 and win.play_until is None, 6),

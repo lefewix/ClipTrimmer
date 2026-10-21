@@ -10,9 +10,9 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout,
-                               QLabel, QMainWindow, QMessageBox, QPushButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+                               QLabel, QMainWindow, QMessageBox, QPushButton, QSlider,
+                               QStyle, QStyleOptionSlider, QVBoxLayout, QWidget)
 
 from . import library, theme
 from .browser import ClipBrowser
@@ -87,6 +87,56 @@ class Stage(QWidget):
     def resizeEvent(self, e):
         self.video.setGeometry(self.rect())
         super().resizeEvent(e)
+
+
+class Column(QWidget):
+    """The video, the play controls and the frame strip as one column exactly as wide as a
+    16:9 picture, centred in its space. Spare room becomes even margins, never black bars."""
+    SIDE, TOP, BOTTOM = 24, 20, 12
+    GAP_CONTROLS = 20      # video to controls
+    GAP_STRIP = 4          # controls to strip (the strip already keeps 28 px above the frames for IN flags)
+
+    def __init__(self, stage, controls, strip, on_width, parent=None):
+        super().__init__(parent)
+        self.stage, self.controls, self.strip, self.on_width = stage, controls, strip, on_width
+        for w in (stage, controls, strip):
+            w.setParent(self)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        w, h = self.width(), self.height()
+        ch, sh = self.controls.sizeHint().height(), self.strip.height()
+        rest = self.TOP + ch + self.GAP_CONTROLS + self.GAP_STRIP + sh + self.BOTTOM
+        pw = max(0, min(w - 2 * self.SIDE, int((h - rest) * 16 / 9)))
+        ph = round(pw * 9 / 16)
+        x = (w - pw) // 2
+        y = self.TOP + max(0, (h - rest - ph) // 2)
+        self.stage.setGeometry(x, y, pw, ph)
+        y += ph + self.GAP_CONTROLS
+        cw = min(w, max(pw, self.controls.minimumSizeHint().width()))    # never clip Set In / Set Out
+        self.controls.setGeometry((w - cw) // 2, y, cw, ch)
+        y += ch + self.GAP_STRIP
+        self.strip.setGeometry(x, y, pw, sh)
+        self.on_width(cw)
+
+
+class Slider(QSlider):
+    """A slider that jumps to where you click on the line, then drags from there."""
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            st = self.style()
+            handle = st.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                       QStyle.SubControl.SC_SliderHandle, self)
+            if not handle.contains(e.position().toPoint()):
+                groove = st.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                           QStyle.SubControl.SC_SliderGroove, self)
+                x = int(e.position().x() - groove.x() - handle.width() / 2)
+                self.setValue(QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), x, groove.width() - handle.width()))
+        super().mousePressEvent(e)    # the handle is now under the cursor, so this starts a drag
 
 
 class Cover(QObject):
@@ -180,29 +230,27 @@ class MainWindow(QMainWindow):
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
-        left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(0)
-
         self.video = VideoView(self.player)
         self.video.setFocusPolicy(Qt.FocusPolicy.ClickFocus)    # clicking the video takes the keyboard back from the size box
         self.empty = ClipBrowser(self.ffmpeg, self.ffprobe, lambda: self.path)
         stage = Stage(self.video)
-        wrap = QWidget()
-        wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(24, 20, 24, 0)
-        wl.addWidget(stage)
-        lv.addWidget(wrap, 1)
 
-        tr = QHBoxLayout()
-        tr.setContentsMargins(24, 12, 24, 12)
-        tr.setSpacing(12)
+        # Transport: play controls centred, volume at the right edge of the video. The two
+        # outer columns stretch equally so the play button stays in the middle of the video.
+        controls = QWidget()
+        tr = QGridLayout(controls)
+        tr.setContentsMargins(0, 0, 0, 0)
+        tr.setHorizontalSpacing(0)       # the empty left column gets no spacing, so none at all
+        mid = QHBoxLayout()
+        mid.setSpacing(12)
         self.in_btn = _button("Set In", "setIn", theme.icon("square", theme.GREEN, 12),
                               "Mark where the section starts (I)")
         self.out_btn = _button("Set Out", "setOut", theme.icon("square", theme.RED, 12),
                                "Mark where the section ends (O)")
         self.out_btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        for b in (self.in_btn, self.out_btn):     # never squeeze the labels, widen the window instead
+            b.ensurePolished()
+            b.setMinimumWidth(b.sizeHint().width())
         self.time_label = _label("0:00.00", "time")
         self.time_label.setFixedWidth(80)
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -212,20 +260,32 @@ class MainWindow(QMainWindow):
         self.next_btn = _button("", "iconBtn", theme.icon("next", theme.TEXT), "Next frame (→)")
         self.play_btn = _button("", "play", theme.icon("play", theme.BG, 14), "Play / pause (Space)")
         self.play_btn.setIconSize(QSize(14, 14))
-        tr.addStretch()
         for w in (self.in_btn, self.time_label, self.prev_btn, self.play_btn,
                   self.next_btn, self.dur_label, self.out_btn):
-            tr.addWidget(w)
-        tr.addStretch()
-        lv.addLayout(tr)
+            mid.addWidget(w)
+        self.mute_btn = _button("", "iconBtn", theme.icon("volume", theme.TEXT2), "Mute (M)")
+        self.volume = Slider(Qt.Orientation.Horizontal)
+        self.volume.setObjectName("volume")
+        self.volume.setRange(0, 100)
+        self.volume.setPageStep(10)
+        self.volume.setMinimumWidth(60)
+        self.volume.setMaximumWidth(100)
+        self.volume.setFocusPolicy(Qt.FocusPolicy.NoFocus)    # arrow keys stay frame-step
+        self.volume.setCursor(Qt.CursorShape.PointingHandCursor)
+        vol = QHBoxLayout()
+        vol.setSpacing(4)
+        vol.addStretch()
+        vol.addWidget(self.mute_btn)
+        vol.addWidget(self.volume, 1)
+        self.transport = mid
+        tr.addLayout(mid, 0, 1)
+        tr.addLayout(vol, 0, 2)
+        tr.setColumnStretch(0, 1)
+        tr.setColumnStretch(2, 1)
 
         self.strip = Strip(self.model)
         self.strip.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        sw = QWidget()
-        sl = QVBoxLayout(sw)
-        sl.setContentsMargins(24, 0, 24, 18)
-        sl.addWidget(self.strip)
-        lv.addWidget(sw)
+        left = Column(stage, controls, self.strip, self._fit_volume)
 
         body.addWidget(left, 1)
         self.rail = Rail()
@@ -235,6 +295,7 @@ class MainWindow(QMainWindow):
         v.addWidget(editor, 1)
         # The clip browser covers the editor (everything under the header) until a clip is picked.
         self.cover = Cover(editor, self.empty)
+        self._sync_video()
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -283,6 +344,10 @@ class MainWindow(QMainWindow):
         act(p, "Back to clip", self.hide_browser, "Esc")
         self.a_home = act(p, "Go to start", lambda: self.seek_to(0), "Home")
         self.a_end = act(p, "Go to end", lambda: self.seek_to(self.duration), "End")
+        p.addSeparator()
+        act(p, "Mute", self.toggle_mute, "M")
+        act(p, "Volume up", lambda: self.volume.setValue(self.volume.value() + 10), "Up")
+        act(p, "Volume down", lambda: self.volume.setValue(self.volume.value() - 10), "Down")
 
         hm = mb.addMenu("&Help")
         act(hm, "Keyboard shortcuts", self.show_shortcuts, "F1")
@@ -308,6 +373,8 @@ class MainWindow(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_play)
         self.prev_btn.clicked.connect(lambda: self.step(False))
         self.next_btn.clicked.connect(lambda: self.step(True))
+        self.mute_btn.clicked.connect(self.toggle_mute)
+        self.volume.valueChanged.connect(self.on_volume)
         self.strip.scrubbed.connect(self.on_scrub)
         self.strip.edge_drag_started.connect(self.on_edge_start)
         self.strip.edge_dragged.connect(self.on_edge_drag)
@@ -341,6 +408,9 @@ class MainWindow(QMainWindow):
         self.rail.set_target(int(self.settings.value("target_mb", 10)))
         self.rail.set_resolution(int(self.settings.value("resolution", 0)))
         self.rail.audio.setChecked(self.settings.value("keep_audio", "true") in (True, "true"))
+        self.muted = self.settings.value("muted", "false") in (True, "true")
+        self.volume.setValue(int(self.settings.value("volume", 100)))
+        self.on_volume(self.volume.value())
         geo = self.settings.value("geometry")
         if geo:
             self.restoreGeometry(geo)
@@ -408,14 +478,20 @@ class MainWindow(QMainWindow):
         self.empty.mark_open()
         self.empty.show()
         self.empty.raise_()
+        self._sync_video()
         self._browser_header()
         self.refresh()          # editing shortcuts (Delete, Space, I/O...) are off while the clip is hidden
 
     def hide_browser(self):
         if self.path:
             self.empty.hide()
+            self._sync_video()
             self._editor_header()
             self.refresh()
+
+    def _sync_video(self):
+        # The video is a native window, which would show through the browser laid over it.
+        self.video.setVisible(self.empty.isHidden())
 
     def toggle_browser(self):
         if not self.empty.isHidden():
@@ -488,6 +564,7 @@ class MainWindow(QMainWindow):
         self.strip.set_duration(self.duration)
         self.strip.clear_thumbs()
         self.thumb_gen = self.thumbs.start(path, self.duration, THUMBS)
+        self.video.attach()
         self.player.load(path)
         self.set_ui_pos(0.0)
         name = Path(path).stem
@@ -498,6 +575,7 @@ class MainWindow(QMainWindow):
                           f"{info['size'] / 1048576:.0f} MB")
         self.dur_label.setText(fmt(self.duration))
         self.empty.hide()
+        self._sync_video()
         self._editor_header()
         rec = [path] + [p for p in self.recent() if os.path.normcase(p) != os.path.normcase(path)]
         self.settings.setValue("recent", rec[:10])
@@ -549,6 +627,25 @@ class MainWindow(QMainWindow):
         else:
             self.play_until = None
             self.player.pause()
+
+    def on_volume(self, v):
+        # Dragging the slider up while muted unmutes, like most players.
+        if self.muted and v > 0 and self.sender() is self.volume:
+            self.muted = False
+        quiet = self.muted or v == 0
+        self.mute_btn.setIcon(theme.icon("mute" if quiet else "volumeLow" if v < 50 else "volume",
+                                         theme.TEXT2))
+        self.mute_btn.setToolTip(f"{'Unmute' if self.muted else 'Mute'} (M) · volume {v}%")
+        self.player.set_volume(v, self.muted)
+        self.settings.setValue("volume", v)
+        self.settings.setValue("muted", self.muted)
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if not self.muted and self.volume.value() == 0:
+            self.volume.setValue(50)       # unmuting at 0 would still be silent
+        else:
+            self.on_volume(self.volume.value())
 
     def seek_to(self, t, exact=True):
         if not self.path:
@@ -762,12 +859,19 @@ class MainWindow(QMainWindow):
             subprocess.Popen(f'explorer /select,"{os.path.normpath(self.last_export)}"')
 
     # --------------------------------------------------------------- misc
+    def _fit_volume(self, width):
+        # Narrow column: drop the slider (the speaker button, M and ↑/↓ still work) rather
+        # than let it push the play controls off-centre or under Set Out.
+        room = width - self.transport.sizeHint().width()
+        self.volume.setVisible(room >= 2 * (36 + 4 + self.volume.minimumWidth()))
+
     def show_shortcuts(self):
         rows = [("I", "Set In"), ("O", "Set Out"), ("N", "New section at playhead"),
                 ("Delete", "Delete the selected section"), ("Space / K", "Play / pause"),
                 ("P", "Play the selected section"), ("← / ,", "Previous frame"),
                 ("→ / .", "Next frame"), ("Shift+← / J", "Back 1 second"),
                 ("Shift+→ / L", "Forward 1 second"), ("Home / End", "Start / end of clip"),
+                ("M", "Mute / unmute"), ("↑ / ↓", "Volume up / down"),
                 ("Ctrl+Z / Ctrl+Y", "Undo / redo"), ("Ctrl+E", "Export"),
                 ("Ctrl+Shift+C", "Copy the exported file"), ("Ctrl+O / Ctrl+L", "Open / open latest replay")]
         html = "<table cellspacing='6'>" + "".join(
@@ -803,7 +907,6 @@ class MainWindow(QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         self.thumbs.shutdown()
         self.empty.shutdown()
-        self.video.free()
         self.player.terminate()
         e.accept()
 

@@ -1,30 +1,16 @@
-"""Video playback: libmpv rendered into a Qt OpenGL widget.
+"""Video playback: libmpv drawing straight into a native child window with Direct3D 11.
 
-Rendering through mpv's render API (instead of handing mpv a window handle)
-keeps the video a normal Qt widget, so clicks, keys and overlays just work.
+D3D11 lets the GPU decoder hand frames to the renderer without copying them
+back to system memory, which uses far less RAM and CPU than OpenGL (whose AMD
+driver alone costs ~250 MB). mpv's window lets clicks pass through to the
+Qt widget underneath, so clicks and keys still stay in Qt.
 """
-import ctypes
-
 import mpv
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import QWidget
 
-_opengl32 = ctypes.WinDLL("opengl32")
-_wglGetProcAddress = _opengl32.wglGetProcAddress
-_wglGetProcAddress.restype = ctypes.c_void_p
-_wglGetProcAddress.argtypes = [ctypes.c_char_p]
-_kernel32 = ctypes.WinDLL("kernel32")
-_kernel32.GetProcAddress.restype = ctypes.c_void_p
-_kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-
-
-def _gl_proc(_ctx, name):
-    # wglGetProcAddress only knows extension/GL>1.1 functions; the 1.1 core
-    # ones come straight from opengl32.dll.
-    addr = _wglGetProcAddress(name)
-    if not addr or addr in (1, 2, 3) or addr == ctypes.c_void_p(-1).value:
-        addr = _kernel32.GetProcAddress(_opengl32._handle, name)
-    return addr or 0
+from . import theme
 
 
 class Player(QObject):
@@ -39,8 +25,11 @@ class Player(QObject):
         self.seeking = False      # True from seek() until mpv shows the new frame
         self._restarted.connect(self._seek_done)
         self.mpv = mpv.MPV(
-            vo="libmpv",
-            hwdec="auto-copy",            # GPU decode (HEVC/AV1), copied back for GL
+            vo="gpu-next",
+            gpu_api="d3d11",
+            hwdec="auto-safe",            # GPU decode (HEVC/AV1), frames stay on the GPU
+            input_cursor_passthrough=True,  # mpv's window ignores the mouse; Qt gets the clicks
+            cursor_autohide="no",
             keep_open="always",           # stay on the last frame at the end
             hr_seek="yes",                # exact seeks land on the exact frame
             hr_seek_framedrop="yes",
@@ -90,6 +79,13 @@ class Player(QObject):
     def is_paused(self):
         return bool(self.mpv.pause)
 
+    def set_volume(self, percent, muted=False):
+        try:
+            self.mpv.volume = max(0, min(100, percent))
+            self.mpv.mute = muted
+        except (mpv.ShutdownError, SystemError, OSError):
+            pass
+
     def seek(self, t, exact=True):
         self.seeking = True
         try:
@@ -120,40 +116,30 @@ class Player(QObject):
             pass
 
 
-class VideoView(QOpenGLWidget):
+class VideoView(QWidget):
+    """A native window for mpv to draw into. Being native, it always sits on top of
+    ordinary widgets, so the app hides it while the clip browser covers the editor."""
     clicked = Signal()
-    _frame = Signal()
 
     def __init__(self, player, parent=None):
         super().__init__(parent)
         self.player = player
-        self.ctx = None
-        self._proc = mpv.MpvGlGetProcAddressFn(_gl_proc)
-        self._frame.connect(self.update, Qt.ConnectionType.QueuedConnection)
+        self._attached = False
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(320, 180)
 
-    def initializeGL(self):
-        self.ctx = mpv.MpvRenderContext(
-            self.player.mpv, "opengl",
-            opengl_init_params={"get_proc_address": self._proc})
-        self.ctx.update_cb = self._frame.emit
+    def attach(self):
+        """Give mpv this window. Call once the widget is in the window, before the first load."""
+        if not self._attached:
+            self.player.mpv.wid = str(int(self.winId()))
+            self._attached = True
 
-    def paintGL(self):
-        if not self.ctx:
-            return
-        r = self.devicePixelRatioF()
-        self.ctx.render(flip_y=True, opengl_fbo={
-            "w": int(self.width() * r), "h": int(self.height() * r),
-            "fbo": self.defaultFramebufferObject()})
+    def paintEvent(self, _e):
+        # Only seen before the first clip, or between clips; mpv's window covers it otherwise.
+        QPainter(self).fillRect(self.rect(), QColor(theme.BG))
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
-
-    def free(self):
-        if self.ctx:
-            self.makeCurrent()
-            self.ctx.update_cb = None
-            self.ctx.free()
-            self.ctx = None
-            self.doneCurrent()

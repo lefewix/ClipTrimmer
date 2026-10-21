@@ -66,6 +66,12 @@ _ICONS = {
     "check": '<path d="m3 8.5 3.2 3L13 4.5" fill="none" stroke="{c}" stroke-width="1.8"/>',
     "folder": '<path d="M1.5 4.5v8h13v-6.5H8L6.5 4.5z" fill="none" stroke="{c}" stroke-width="1.4"/>',
     "square": '<rect x="4" y="4" width="8" height="8" rx="1.5" fill="{c}"/>',
+    "volume": '<path d="M1.5 6h2.5l3.5-3v10L4 10H1.5z" fill="{c}"/>'
+              '<path d="M10 5.5a3.5 3.5 0 0 1 0 5M11.8 3.3a6.5 6.5 0 0 1 0 9.4" fill="none" stroke="{c}" stroke-width="1.4"/>',
+    "volumeLow": '<path d="M1.5 6h2.5l3.5-3v10L4 10H1.5z" fill="{c}"/>'
+                 '<path d="M10 5.5a3.5 3.5 0 0 1 0 5" fill="none" stroke="{c}" stroke-width="1.4"/>',
+    "mute": '<path d="M1.5 6h2.5l3.5-3v10L4 10H1.5z" fill="{c}"/>'
+            '<path d="m10 6 4 4M14 6l-4 4" fill="none" stroke="{c}" stroke-width="1.4"/>',
 }
 
 
@@ -238,6 +244,14 @@ QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: #2A2A2A; border-radius: 4px; min-height: 24px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+QSlider#volume {{ min-height: 20px; }}
+QSlider#volume::groove:horizontal {{ background: {LINE2}; height: 4px; border-radius: 2px; }}
+QSlider#volume::sub-page:horizontal {{ background: {TEXT2}; height: 4px; border-radius: 2px; }}
+QSlider#volume::sub-page:horizontal:disabled {{ background: #3A3A3A; }}
+QSlider#volume::handle:horizontal {{ background: {TEXT}; width: 12px; height: 12px; margin: -4px 0;
+  border-radius: 6px; }}
+QSlider#volume::handle:horizontal:hover {{ background: #FFFFFF; }}
+QSlider#volume::handle:horizontal:disabled {{ background: #4E4E4E; }}
 QProgressBar {{ background: {BG}; border: none; border-radius: 3px; min-height: 6px; max-height: 6px; }}
 QProgressBar::chunk {{ background: {AMBER}; border-radius: 3px; }}
 QToolTip {{ background: {SURFACE}; color: {TEXT}; border: 1px solid {LINE3}; padding: 4px 8px; }}

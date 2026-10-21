@@ -30,6 +30,7 @@ It's built around OBS replay-buffer clips: 2-minute HEVC 1080p120 mp4s with thre
 | I / O / N | Set In / Set Out / new section at the playhead |
 | Space or K, P | Play/pause, play the selected section |
 | ← → (or , .) | One frame back/forward; Shift+← → or J/L = 1 second |
+| M, ↑ ↓ | Mute, volume up/down (the slider sits right of Set Out; remembered between runs) |
 | Delete, Ctrl+Z / Ctrl+Y | Delete the selected section, undo/redo |
 | Ctrl+E, Ctrl+Shift+C | Export, copy the exported file |
 | F1 | All shortcuts |
@@ -107,7 +108,7 @@ clipt\rail.py        right panel: sections, size, bitrate card, export states
 clipt\strip.py       frame strip with In/Out flags
 clipt\engine.py      ffmpeg export (cut, join, two-pass to size)
 clipt\model.py       sections + undo
-clipt\player.py      mpv playback in a QOpenGLWidget
+clipt\player.py      mpv playback, drawn with Direct3D 11 into a native window
 clipt\theme.py       colours, fonts, icons, style sheet
 ```
 
