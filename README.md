@@ -1,115 +1,137 @@
+<div align="center">
+
+<img src="assets/icon.png" width="88" alt="ClipTrimmer icon">
+
 # ClipTrimmer
 
-Cut the good moment out of a game replay and shrink it to fit Discord (or any size), in a native Windows app.
+**Cut the best moment out of a game replay and shrink it to fit Discord.**
 
-ClipTrimmer 2.0 is a Qt + mpv rewrite of the original browser-based ClipTrimmer (still in this repo's history).
-It's built around OBS replay-buffer clips: 2-minute HEVC 1080p120 mp4s with three named audio tracks, saved to
-`Videos\OBS`.
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
+![Qt](https://img.shields.io/badge/Qt-PySide6-41CD52?style=flat-square&logo=qt&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
 
-## What it does
+</div>
 
-- **Your clips**: opens to every replay in the folder as a card, grouped by day (Today, Yesterday,
-  Wednesday, Oct 3…), newest first. Each card shows the moment the replay was saved, its time and length, and a
-  green **Trimmed** tag once you've exported from it. The clip that's open in the editor is outlined and
-  tagged **Open**. Right-click a card to play it, show it in Explorer or move it to the Recycle Bin.
-- **Thumbnails that show the moment**: each replay gets a *cover picture*, the frame from 4 seconds before the
-  end (just before you pressed save). File Explorer uses it as the thumbnail, too.
-- **Trim**: mark sections with **Set In / Set Out** (or I / O) on a frame strip, drag the flags to adjust,
-  play a section on its own. Several sections are joined in timeline order.
-- **Export to a size**: 10 MB (Discord), 50 MB (Nitro), 512 MB (X) or a custom size, with an optional
-  resolution cap and audio on/off. Two-pass x264 hits the size; the **Estimated bitrate** card shows the
-  quality you'll get. After exporting, **Copy file** puts it on the clipboard to paste into Discord.
+A native Windows app built around OBS replay-buffer clips. Pick a clip, mark the parts you want, choose a
+file size, export. Version 2.0 is a Qt + mpv rewrite of the original browser-based version (still in the
+history).
 
-## Using it
+## Features
 
-| Where | What |
+- **Clip library**: every replay as a card, grouped by day, with a **Trimmed** tag once exported
+- **Cover thumbnails**: each clip gets the frame just before you hit save, also used by File Explorer
+- **Frame-accurate trimming**: In/Out flags on a frame strip, several sections joined in order
+- **Export to a size**: 10 MB (Discord), 50 MB (Nitro), 512 MB (X) or custom, using two-pass x264
+- **Hardware playback**: mpv drawn with Direct3D 11, low CPU even on 1080p120 HEVC
+- **One-click share**: **Copy file** puts the export on the clipboard, ready to paste into Discord
+
+## Install
+
+1. Download or clone this repo
+2. Build it (see [Development](#development)), then run `dist\ClipTrimmer\ClipTrimmer.exe`
+
+## Usage
+
+1. Open ClipTrimmer: it lists your replays (`Videos\OBS` by default)
+2. Click a clip, then press **I** and **O** to mark a section (add more with **N**)
+3. Pick a target size and press **Ctrl+E** to export
+4. Press **Ctrl+Shift+C** to copy the file, then paste it into Discord
+
+<details>
+<summary><b>All keyboard shortcuts</b></summary>
+
+| Keys | Action |
 |---|---|
-| Top-left button | **‹ All clips** in the editor, **‹ Back to clip** in the clip list. Same spot on both screens. |
 | Ctrl+B / Esc | All clips / back to the clip |
 | Ctrl+L | Open the newest replay |
 | I / O / N | Set In / Set Out / new section at the playhead |
 | Space or K, P | Play/pause, play the selected section |
 | ← → (or , .) | One frame back/forward; Shift+← → or J/L = 1 second |
-| M, ↑ ↓ | Mute, volume up/down (the slider sits right of Set Out; remembered between runs) |
-| Delete, Ctrl+Z / Ctrl+Y | Delete the selected section, undo/redo |
+| M, ↑ ↓ | Mute, volume up/down |
+| Delete, Ctrl+Z / Ctrl+Y | Delete section, undo/redo |
 | Ctrl+E, Ctrl+Shift+C | Export, copy the exported file |
 | F1 | All shortcuts |
 
-Exports go to the Desktop unless you pick another folder (File → Output folder…). The replays folder is
-`Videos\OBS` by default (File → Replays folder…, or **Change…** in the clip list).
+</details>
 
-Only one ClipTrimmer runs at a time: starting it again (e.g. from PadDeck) brings the open window to the
-front, and opens the clip if one was given.
-
-### Command line
+<details>
+<summary><b>Command line</b></summary>
 
 ```
 ClipTrimmer.exe [clip.mp4]          open a clip
 ClipTrimmer.exe --covers [clip …]   add cover pictures without opening a window
 ```
 
-`--covers` with no file does the whole replays folder. With a file it waits for the file to finish being
+`--covers` with no file does the whole replays folder. With a file, it waits for the file to finish being
 written first. [PadDeck](https://github.com/lefewix/PadDeck) runs it right after it saves an OBS replay.
+Only one ClipTrimmer runs at a time; starting it again brings the open window to the front.
 
-## How covers stay safe
+</details>
+
+## How it works
+
+Playback is libmpv rendering into a native Direct3D 11 window inside the Qt UI. Exports go through ffmpeg:
+sections are cut, joined and encoded in two passes, with the bitrate worked out from the target size and
+the total length.
+
+<details>
+<summary><b>How covers stay safe</b></summary>
 
 Adding a cover rewrites the mp4, so it's careful:
 
-- It's a **lossless remux** (`ffmpeg -c copy`): video and audio packets are untouched. Audio track names
-  (OBS's "Game audio", "Mic"…) are carried over.
-- It goes to a temp file next to the clip (`~cover <pid> <name>`), which is **checked** (same length, same
-  streams plus the picture, not smaller) before it replaces the original. Created/modified dates are kept.
-- A lock file (`~cover <name>.lock`) stops two programs working on the same clip. Files changed in the last
-  10 seconds (OBS may still be writing) and the clip open in the player are skipped. If anything holds the
-  file open, the swap simply fails and nothing changes. Temp files left by a crash are cleaned up after 10 minutes.
+- It's a **lossless remux** (`ffmpeg -c copy`): video and audio packets are untouched, and audio track
+  names (OBS's "Game audio", "Mic"…) are carried over.
+- It writes to a temp file next to the clip, which is **checked** (same length, same streams plus the
+  picture, not smaller) before it replaces the original. Created/modified dates are kept.
+- A lock file stops two programs working on the same clip. Files changed in the last 10 seconds (OBS may
+  still be writing) and the clip open in the player are skipped. Temp files left by a crash are cleaned up
+  after 10 minutes.
 - Only `.mp4` / `.m4v` get covers; other formats just get a card picture.
 
-## Building
+</details>
 
-Needs Python 3.12 and the binaries below.
-
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-powershell -ExecutionPolicy Bypass -File build.ps1     # → dist\ClipTrimmer\ClipTrimmer.exe
-```
-
-Run `build.ps1` with `-File` as shown: started with `&` from a PowerShell prompt, PowerShell treats
-PyInstaller's progress output as an error and stops.
-
-Run from source: `.venv\Scripts\pythonw.exe ClipTrimmer.pyw [clip]`.
-
-### `bin\` (not in git; too big for GitHub)
-
-| File | Source |
-|---|---|
-| `ffmpeg.exe`, `ffprobe.exe` | [BtbN FFmpeg builds](https://github.com/BtbN/FFmpeg-Builds/releases), win64 **gpl** (needs libx264) |
-| `libmpv-2.dll` | [shinchiro mpv builds](https://github.com/shinchiro/mpv-winbuild-cmake/releases), `mpv-dev-x86_64` |
-
-## Tests
-
-```powershell
-.venv\Scripts\python.exe tests\test_engine.py  <workdir>        # export engine + sections (36)
-.venv\Scripts\python.exe tests\test_library.py <workdir>        # clip list, covers, locks, cleanup (29)
-.venv\Scripts\python.exe tests\ui_smoke.py <workdir> <shots>    # drives the real window (58); run test_engine first
-```
-
-They make their own synthetic clips in `<workdir>` and never touch your replays folder. `ui_smoke` opens a window
-for about a minute and uses its own settings store.
-
-## Layout
+<details>
+<summary><b>Project layout</b></summary>
 
 ```
 ClipTrimmer.pyw      entry point (sets up PATH for bin\)
-clipt\app.py         main window, header/navigation, single instance, --covers
+clipt\app.py         main window, navigation, single instance, --covers
 clipt\browser.py     the clip list (cards, cover loader, folder watcher)
 clipt\library.py     listing, day grouping, cover remux
 clipt\rail.py        right panel: sections, size, bitrate card, export states
 clipt\strip.py       frame strip with In/Out flags
 clipt\engine.py      ffmpeg export (cut, join, two-pass to size)
 clipt\model.py       sections + undo
-clipt\player.py      mpv playback, drawn with Direct3D 11 into a native window
+clipt\player.py      mpv playback via Direct3D 11
 clipt\theme.py       colours, fonts, icons, style sheet
 ```
 
-Fonts: Instrument Sans and JetBrains Mono (SIL Open Font License), bundled in `clipt\fonts`.
+</details>
+
+## Development
+
+Needs Python 3.12, plus ffmpeg and mpv in `bin\` (not in git, too big):
+
+| File | Source |
+|---|---|
+| `ffmpeg.exe`, `ffprobe.exe` | [BtbN FFmpeg builds](https://github.com/BtbN/FFmpeg-Builds/releases), win64 **gpl** |
+| `libmpv-2.dll` | [shinchiro mpv builds](https://github.com/shinchiro/mpv-winbuild-cmake/releases), `mpv-dev-x86_64` |
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File build.ps1      # → dist\ClipTrimmer\ClipTrimmer.exe
+```
+
+Tests make their own synthetic clips and never touch your replays:
+
+```powershell
+.venv\Scripts\python.exe tests\test_engine.py  <workdir>        # export engine (36)
+.venv\Scripts\python.exe tests\test_library.py <workdir>        # clip list, covers, locks (29)
+.venv\Scripts\python.exe tests\ui_smoke.py <workdir> <shots>    # drives the real window (58)
+```
+
+## License
+
+[MIT](LICENSE) © Felix Wang. Bundled fonts (Instrument Sans, JetBrains Mono) are under the SIL Open Font License.
